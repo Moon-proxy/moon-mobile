@@ -1,0 +1,57 @@
+[package]
+name = "moonmobile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Bridge between MoonTerminal's moon-core and the MoonMobile app"
+
+[lib]
+name = "moonmobile"
+# cdylib: libmoonmobile.so for Android. rlib: the desktop check tool (src/bin/mmcli.rs).
+# The iOS build asks for a staticlib on its command line (`cargo rustc --crate-type staticlib`),
+# so the Android build makes nothing extra.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The JNI entry points the Android app calls. Off for desktop builds of the bridge.
+android = ["dep:jni"]
+# The C entry points the iOS app calls (src/ffi.rs, declared in include/moonmobile.h).
+ffi = []
+
+[dependencies]
+# MoonTerminal's logic without its window. Built from a local checkout of the released tag with
+# this repository's `patches/` applied: `scripts/fetch-moon-core.sh` prepares it (it names the
+# tag) and CI runs the same script. The patch adds per-market trade retention; without it one
+# open chart costs the whole exchange's trade history in memory.
+# Without the default `desktop` feature there is no OS keyring: servers.enc opens by its
+# encryption password only.
+moon-core = { path = "../third_party/MoonTerminal/crates/moon-core", default-features = false }
+# The station's setup over SSH, the terminal's own (Settings → Станция): the same server steps,
+# the same pins and checks. Without `desktop` its app key comes from the phone's keystore.
+moon-remote = { path = "../third_party/MoonTerminal/crates/moon-remote", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+jni = { version = "0.21", optional = true, default-features = false }
+# The chart is drawn on the CPU into the buffer the app shows: the same picture on the phone and
+# in the desktop check (`mmcli --chart`), with no GPU code to port.
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd", "png-format"] }
+fontdue = "0.9"
+# The app's own section of `settings.toml`; the same version moon-core already builds with.
+toml = "0.8"
+# The report export (src/export.rs): dates in the phone's zone and the .xlsx archive. The same
+# versions and features moon-core already builds with, so nothing new is compiled.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+chrono-tz = "0.10"
+iana-time-zone = "0.1"
+# The station's first-login password and key text, wiped after use (src/station.rs).
+zeroize = "1"
+# moon-remote's errors, read back for the app's words; the version moon-core already builds with.
+anyhow = "1"
+zip = { version = "9.0.3", default-features = false, features = ["deflate-flate2"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true

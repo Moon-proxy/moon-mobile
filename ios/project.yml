@@ -1,0 +1,126 @@
+# The iOS app's Xcode project, described for XcodeGen: CI runs `xcodegen generate` here and
+# builds the result, so no .xcodeproj is kept in the repository (nobody here edits one in Xcode).
+#
+# The Rust bridge is linked as a static library that CI builds first into build/rust/, together
+# with build/rust.xcconfig: the linker flags rustc reports the library needs. The screens are the
+# shared Kotlin code (android/app/src/commonMain) as MoonMobileKit.framework, which CI builds with
+# Gradle; the pictures, sounds and changelog are copied in from the Android app (build/bundled).
+name: MoonMobile
+options:
+  bundleIdPrefix: app.moonmobile
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: build/rust.xcconfig
+  Release: build/rust.xcconfig
+settings:
+  base:
+    # iOS takes digits only; the app shows its own build caption (MMBuildLabel).
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    MM_BUILD_LABEL: ""
+    MM_VERSION_NAME: ""
+targets:
+  MoonMobile:
+    type: application
+    platform: iOS
+    sources:
+      - path: MoonMobile
+      # The widget's state store, the same file in the app and in the widget.
+      - path: Shared
+      # Pictures and the changelog flat in the bundle, the detect sounds in its sounds/ folder.
+      - path: build/bundled/root
+        buildPhase: resources
+      - path: build/bundled/sounds
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - framework: ../android/app/build/bin/iosArm64/releaseFramework/MoonMobileKit.framework
+        embed: true
+        codeSign: false
+      # The home-screen widget, in the app's PlugIns.
+      - target: MoonWidget
+        embed: true
+        codeSign: false
+    scheme: {}
+    info:
+      path: MoonMobile/Info.plist
+      properties:
+        CFBundleDisplayName: MoonMobile
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        MMBuildLabel: $(MM_BUILD_LABEL)
+        MMVersionName: $(MM_VERSION_NAME)
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        # The app's folder shows up in Files (On My iPhone → MoonMobile): servers.enc can be put
+        # there and the bridge's logs taken from there.
+        # An iPad turns to landscape for the chart only when the app keeps its whole screen:
+        # iPadOS honours an app's orientations only outside Split View and Slide Over.
+        UIRequiresFullScreen: true
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        NSLocalNetworkUsageDescription: MoonMobile подключается к ядрам Moonbot, в том числе в локальной сети.
+        NSFaceIDUsageDescription: Вход в MoonMobile по Face ID вместо пароля приложения.
+        CADisableMinimumFrameDurationOnPhone: true
+        ITSAppUsesNonExemptEncryption: false
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.moonmobile.ios
+        PRODUCT_NAME: MoonMobile
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: MoonMobile/BridgingHeader.h
+        LIBRARY_SEARCH_PATHS: $(PROJECT_DIR)/build/rust
+        FRAMEWORK_SEARCH_PATHS: $(PROJECT_DIR)/../android/app/build/bin/iosArm64/releaseFramework
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # The pictures stay plain PNG: Xcode's iOS variant of them (CgBI) is unreadable to Skia,
+        # which draws the shared screens.
+        COMPRESS_PNG_FILES: NO
+        STRIP_PNG_TEXT: NO
+        GENERATE_INFOPLIST_FILE: NO
+        # Unsigned: the build is signed on the owner's PC (Sideloadly) with his own Apple ID.
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+
+  # The home-screen widget (WidgetKit): SwiftUI only, no Kotlin and no Rust — it draws the state
+  # the app leaves for it (Shared/WidgetStore.swift). Its entitlements are put in by CI's ad-hoc
+  # signature, which Sideloadly then replaces with the owner's.
+  MoonWidget:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: MoonWidget
+      - path: Shared
+    info:
+      path: MoonWidget/Info.plist
+      properties:
+        CFBundleDisplayName: MoonMobile
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.moonmobile.ios.widget
+        PRODUCT_NAME: MoonWidget
+        SWIFT_VERSION: "5.0"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        APPLICATION_EXTENSION_API_ONLY: YES
+        GENERATE_INFOPLIST_FILE: NO
+        # The project's linker flags name the Rust library, which the widget does not use.
+        OTHER_LDFLAGS: "-ObjC"
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/Frameworks @executable_path/../../Frameworks"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""

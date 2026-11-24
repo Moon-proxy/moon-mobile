@@ -1,0 +1,78 @@
+diff --git a/crates/moon-core/src/feed/live/market_role.rs b/crates/moon-core/src/feed/live/market_role.rs
+index ec2000f..b9f5842 100644
+--- a/crates/moon-core/src/feed/live/market_role.rs
++++ b/crates/moon-core/src/feed/live/market_role.rs
+@@ -114,7 +114,14 @@ impl MarketRoleState {
+             .expect("needs_apply requires a desired market plan");
+         let applied = self.applied.as_ref();
+ 
+-        if applied.is_none_or(|current| current.provider != desired.provider) {
++        if crate::feed::scoped_trades() {
++            // The served markets ARE the subscription here, so a changed list is a changed role.
++            if applied.is_none_or(|current| {
++                current.provider != desired.provider || current.markets != desired.markets
++            }) {
++                apply_scoped_trades(client, server_id, desired.provider, &desired.markets);
++            }
++        } else if applied.is_none_or(|current| current.provider != desired.provider) {
+             apply_market_role(client, server_id, desired.provider);
+         }
+ 
+@@ -229,5 +236,28 @@ fn apply_market_role(client: &MoonClient, server_id: u64, provider: bool) {
+     }
+ }
+ 
++/// Applies a provider role that retains trades for `markets` alone.
++///
++/// An empty list unsubscribes: to MoonProto an empty `subscribe_trades_for` means every market.
++fn apply_scoped_trades(client: &MoonClient, server_id: u64, provider: bool, markets: &[String]) {
++    if provider && !markets.is_empty() {
++        let _ = client.streams().subscribe_trades_for(
++            TradesStreamMode::TradesOnly,
++            markets.iter().map(String::as_str),
++        );
++        log::info!(
++            "core {} -> market provider (trades for {} markets)",
++            crate::feed::core_label(server_id),
++            markets.len()
++        );
++    } else {
++        let _ = client.streams().unsubscribe_all_trades();
++        log::info!(
++            "core {} -> no trade stream",
++            crate::feed::core_label(server_id)
++        );
++    }
++}
++
+ #[cfg(test)]
+ mod tests;
+diff --git a/crates/moon-core/src/feed/mod.rs b/crates/moon-core/src/feed/mod.rs
+index 50174a6..e60f126 100644
+--- a/crates/moon-core/src/feed/mod.rs
++++ b/crates/moon-core/src/feed/mod.rs
+@@ -124,6 +124,24 @@ impl FeedWakeRx {
+     }
+ }
+ 
++/// Whether a market provider keeps trades only for the markets it is asked to serve.
++///
++/// Off, a provider retains every trade of its exchange (`subscribe_all_trades`), which is what
++/// the desktop's screener and instant chart opens need and costs gigabytes. On, it retains the
++/// served markets alone (`subscribe_trades_for`): a host that draws a few charts and no screener.
++static SCOPED_TRADES: AtomicBool = AtomicBool::new(false);
++
++/// Choose between exchange-wide and per-market trade retention. Process-wide; set it before the
++/// sessions start, since a client applies its role when the role changes.
++pub fn set_scoped_trades(on: bool) {
++    SCOPED_TRADES.store(on, Ordering::Release);
++}
++
++/// Whether providers retain trades for their served markets only.
++pub fn scoped_trades() -> bool {
++    SCOPED_TRADES.load(Ordering::Acquire)
++}
++
+ /// Build one wake pair. Every [`FeedWakeTx`] clone shares this latch.
+ ///
+ /// Returns:

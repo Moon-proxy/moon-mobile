@@ -1,0 +1,50 @@
+diff --git a/crates/moon-core/src/market/mod.rs b/crates/moon-core/src/market/mod.rs
+index 97ad3a8..1a9e0bc 100644
+--- a/crates/moon-core/src/market/mod.rs
++++ b/crates/moon-core/src/market/mod.rs
+@@ -26,6 +26,8 @@ use crate::session::CoreId;
+ 
+ pub use candles::{CandleViewCfg, ChartCandle};
+ pub use screener::{ScreenerRow, SharedScreenerRow};
++/// A server's markets table row: volumes and deltas the core calculates for a market.
++pub use moonproto::MarketStats;
+ pub use source::{
+     ArbQuote, ArbVenue, CORE_ARCHIVE_RETENTION_MS, CandleReadParams, CatalogLookup,
+     ChartHistoryBuffers, ChartHistoryCursor, ChartHistoryRead, CoinTag, DetectSnapshot,
+diff --git a/crates/moon-core/src/market/source/read.rs b/crates/moon-core/src/market/source/read.rs
+index b65b9e2..5428ad2 100644
+--- a/crates/moon-core/src/market/source/read.rs
++++ b/crates/moon-core/src/market/source/read.rs
+@@ -636,6 +636,32 @@ impl MarketDataSource {
+         inner.clients.get(&core).and_then(SharedMoonClient::get)
+     }
+ 
++    /// Ask `core`'s server for its markets table: the volumes and deltas it calculates for every
++    /// market, without subscribing to any. The answer lands on the market handles later.
++    ///
++    /// Returns:
++    ///     Whether the request was queued.
++    pub fn refresh_market_stats(&self, core: CoreId) -> bool {
++        self.core_client(core)
++            .is_some_and(|client| client.markets().refresh_stats().is_ok())
++    }
++
++    /// The markets table of `core` as last received, by exchange-native market name. Markets
++    /// with no figures yet are left out; empty until a refresh was answered.
++    pub fn market_stats(&self, core: CoreId) -> Vec<(String, moonproto::MarketStats)> {
++        let Some(client) = self.core_client(core) else {
++            return Vec::new();
++        };
++        let Some(snapshot) = client.snapshot_versioned() else {
++            return Vec::new();
++        };
++        snapshot
++            .markets()
++            .iter()
++            .filter_map(|handle| handle.stats().map(|stats| (handle.name().to_string(), stats)))
++            .collect()
++    }
++
+     /// Return MoonProto's `chart_price_step` for a market: the CHART's aggregation step, not the
+     /// exchange's tick. moonproto derives it from the ask as `max(eps, ask / 5000)` (Delphi
+     /// `AddNewAksPrice`), so it is off the market's price grid — COOL at ~0.0019 reads

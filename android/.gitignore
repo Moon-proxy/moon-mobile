@@ -1,0 +1,8 @@
+.gradle/
+build/
+app/build/
+local.properties
+*.iml
+.idea/
+# Built by CI from ../rust (cargo ndk); never committed.
+app/src/main/jniLibs/

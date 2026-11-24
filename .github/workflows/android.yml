@@ -1,0 +1,219 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+# The build publishes its APK as a release, which needs to create a tag.
+permissions:
+  contents: write
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      # Everything private comes from one repository secret, MM_SECRETS: base64 of a JSON object
+      # with the release key (keystore, base64), its password, and the in-app update — the URL the
+      # app checks (baked into the build) and the server CI puts each build on (host, folder, port,
+      # SSH key). None of it is in the code. Without the secret a build gets the debug signature
+      # and no update; on main that stops the build: a debug-signed APK would not install over
+      # the published ones.
+      - name: Secrets
+        env:
+          MM_SECRETS: ${{ secrets.MM_SECRETS }}
+        run: |
+          if [ -z "$MM_SECRETS" ]; then
+            if [ "$GITHUB_REF" = refs/heads/main ]; then
+              echo "::error::The MM_SECRETS secret is missing"
+              exit 1
+            fi
+            echo "No MM_SECRETS: debug signature, no in-app update"
+            exit 0
+          fi
+          json=$(printf '%s' "$MM_SECRETS" | base64 -d)
+          get() { printf '%s' "$json" | jq -r --arg k "$1" '.[$k] // ""'; }
+          for k in password update_url update_host update_dir; do
+            v=$(get "$k"); [ -n "$v" ] && echo "::add-mask::$v"
+          done
+          get keystore | base64 -d > "$RUNNER_TEMP/moonmobile.jks"
+          get update_ssh_key > "$RUNNER_TEMP/update_key"
+          chmod 600 "$RUNNER_TEMP/moonmobile.jks" "$RUNNER_TEMP/update_key"
+          pw=$(get password)
+          {
+            echo "MM_KEYSTORE_FILE=$RUNNER_TEMP/moonmobile.jks"
+            echo "MM_KEYSTORE_PASSWORD=$pw"
+            echo "MM_KEY_ALIAS=moonmobile"
+            echo "MM_KEY_PASSWORD=$pw"
+            echo "MM_UPDATE_URL=$(get update_url)"
+            echo "UPDATE_HOST=$(get update_host)"
+            echo "UPDATE_DIR=$(get update_dir)"
+            echo "UPDATE_PORT=$(get update_port)"
+            echo "UPDATE_KEY_FILE=$RUNNER_TEMP/update_key"
+          } >> "$GITHUB_ENV"
+
+      # Every build is the next version of its series: v1.0b, v1.01b, v1.02b… VERSION holds the
+      # lowest version the next build may take; past it, the number goes on from the highest
+      # release published, so a failed or cancelled run leaves no gap. The version code counts
+      # minutes since 2026-01-01: every build installs over every earlier one, whichever
+      # repository built it.
+      - name: Version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          base=$(tr -d ' \r\n' < VERSION)
+          major=${base%%.*}
+          stage=$(printf '%s' "$base" | sed -E 's/^[0-9.]+//')
+          minor=$(printf '%s' "$base" | sed -E 's/^[0-9]+\.([0-9]+).*$/\1/')
+          floor=$((10#${minor:-0}))
+          last=-1
+          for tag in $(gh release list --limit 1000 --json tagName --jq '.[].tagName'); do
+            if [[ $tag =~ ^v${major}\.([0-9]+)${stage}$ ]]; then
+              n=$((10#${BASH_REMATCH[1]}))
+              (( n > last )) && last=$n
+            fi
+          done
+          n=$((last + 1))
+          (( n < floor )) && n=$floor
+          if (( n == 0 )); then name="${major}.0${stage}"; else name=$(printf '%s.%02d%s' "$major" "$n" "$stage"); fi
+          echo "Version: v$name"
+          echo "MM_VERSION_NAME=$name" >> "$GITHUB_ENV"
+          echo "MM_VERSION_CODE=$(( ($(date -u +%s) - 1767225600) / 60 ))" >> "$GITHUB_ENV"
+
+      # rust/Cargo.toml builds moon-core from this checkout: the pinned MoonTerminal tag with
+      # patches/ applied. It has to exist before anything reads the Cargo manifest.
+      - name: moon-core with patches
+        run: bash scripts/fetch-moon-core.sh
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # rust/rust-toolchain.toml names the compiler and the Android target; this installs both.
+      - name: Rust toolchain
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      - name: cargo-ndk
+        run: cargo install cargo-ndk --locked --version "^3"
+
+      - name: Rust bridge (arm64)
+        working-directory: rust
+        run: |
+          export ANDROID_NDK_HOME="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "NDK: $ANDROID_NDK_HOME"
+          cargo ndk -t arm64-v8a --platform 29 \
+            -o ../android/app/src/androidMain/jniLibs \
+            build --release --locked --features android
+          ls -la ../android/app/src/androidMain/jniLibs/arm64-v8a/
+
+      # Android 15+ may run with 16 KB memory pages; a library aligned to 4 KB does not load there.
+      - name: Check 16 KB alignment
+        run: |
+          lib=android/app/src/androidMain/jniLibs/arm64-v8a/libmoonmobile.so
+          aligns=$(readelf -lW "$lib" | awk '$1 == "LOAD" { print $NF }' | sort -u)
+          echo "LOAD align: $aligns"
+          for align in $aligns; do
+            if [ $((align)) -lt 16384 ]; then
+              echo "::error::libmoonmobile.so is not aligned to 16 KB"
+              exit 1
+            fi
+          done
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      - name: APK
+        working-directory: android
+        # `bash`: an upload through the web page drops the script's executable bit.
+        run: bash ./gradlew --no-daemon assembleRelease
+
+      - name: Name the APK
+        run: |
+          mkdir -p out
+          cp android/app/build/outputs/apk/release/app-release.apk "out/MoonMobile-v${MM_VERSION_NAME}.apk"
+
+      # On main the APK must carry the release key every installed copy has: an APK signed with
+      # anything else would not install over them.
+      - name: Check signature
+        if: github.ref == 'refs/heads/main'
+        run: |
+          signer=$(ls "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -1)
+          cert=$("$signer" verify --print-certs "out/MoonMobile-v${MM_VERSION_NAME}.apk" | sed -n 's/.*certificate SHA-256 digest: //p' | head -1)
+          echo "Signer SHA-256: $cert"
+          if [ "$cert" != "3da5cf47eb90a8ce6cbdd2951039c371af810c4a984021074fee3139efe32980" ]; then
+            echo "::error::The APK is not signed with the release key"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MoonMobile-apk
+          path: out/*.apk
+          if-no-files-found: error
+
+      # A release carries the APK as a plain file: one tap to download on the phone, where an
+      # Actions artifact arrives as a zip that has to be unpacked first.
+      # What the app's update reads: the version, its build number, the APK's name, checksum and
+      # size, and what is new. Attached to the release too, so a build can be put on the server
+      # by hand: the APK and this file, renamed version.json.
+      - name: Update manifest
+        if: github.ref == 'refs/heads/main'
+        run: |
+          apk="out/MoonMobile-v${MM_VERSION_NAME}.apk"
+          # What is new: the changelog's first block, without its version line.
+          notes=$(awk 'NR == 1 { next } /^$/ { exit } { print }' android/app/src/androidMain/assets/changelog.txt | head -c 3000)
+          jq -n \
+            --arg version "$MM_VERSION_NAME" \
+            --argjson code "$MM_VERSION_CODE" \
+            --arg apk "$(basename "$apk")" \
+            --arg sha256 "$(sha256sum "$apk" | cut -d' ' -f1)" \
+            --argjson size "$(stat -c %s "$apk")" \
+            --arg notes "$notes" \
+            '{version: $version, code: $code, apk: $apk, sha256: $sha256, size: $size, notes: $notes}' \
+            > out/version.json
+          cp out/version.json "out/MoonMobile-v${MM_VERSION_NAME}.version.json"
+          cat out/version.json
+
+      - name: Publish release
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "v${MM_VERSION_NAME}" out/*.apk "out/MoonMobile-v${MM_VERSION_NAME}.version.json" \
+            --target "${{ github.sha }}" \
+            --title "MoonMobile v${MM_VERSION_NAME}" \
+            --notes "Коммит ${{ github.sha }}. Возможности приложения описаны в README." \
+            --latest
+
+      # The in-app update: the APK and then version.json (so a phone never sees a version whose
+      # file is not there yet) go to the owner's server over SSH with the key from MM_SECRETS.
+      # The three newest APKs stay; older ones are removed.
+      - name: Publish update
+        if: github.ref == 'refs/heads/main' && env.UPDATE_HOST != '' && env.UPDATE_DIR != ''
+        run: |
+          apk="out/MoonMobile-v${MM_VERSION_NAME}.apk"
+          name=$(basename "$apk")
+          port="${UPDATE_PORT:-22}"
+          install -m 700 -d ~/.ssh
+          host="${UPDATE_HOST#*@}"
+          ssh-keyscan -p "$port" -H "$host" >> ~/.ssh/known_hosts 2>/dev/null
+          ssh_opts=(-i "$UPDATE_KEY_FILE" -o BatchMode=yes -o StrictHostKeyChecking=yes)
+          scp "${ssh_opts[@]}" -P "$port" "$apk" "$UPDATE_HOST:$UPDATE_DIR/$name"
+          scp "${ssh_opts[@]}" -P "$port" out/version.json "$UPDATE_HOST:$UPDATE_DIR/version.json.new"
+          ssh "${ssh_opts[@]}" -p "$port" "$UPDATE_HOST" \
+            "cd '$UPDATE_DIR' && mv -f version.json.new version.json && ls -t MoonMobile-v*.apk | tail -n +4 | xargs -r rm -f --"
+          rm -f "$UPDATE_KEY_FILE" "$MM_KEYSTORE_FILE"

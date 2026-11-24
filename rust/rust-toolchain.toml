@@ -1,0 +1,4 @@
+# The same compiler MoonTerminal v0.67.3 pins.
+[toolchain]
+channel = "1.97.1"
+targets = ["aarch64-linux-android"]

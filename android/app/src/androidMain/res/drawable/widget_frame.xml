@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The widget's frame: the lock screen's neon outline, red to yellow to green. -->
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <corners android:radius="22dp" />
+            <gradient
+                android:angle="315"
+                android:centerColor="#FFFFE23D"
+                android:endColor="#FF3DFF6E"
+                android:startColor="#FFFF2D4A"
+                android:type="linear" />
+        </shape>
+    </item>
+    <item
+        android:bottom="2dp"
+        android:left="2dp"
+        android:right="2dp"
+        android:top="2dp">
+        <shape android:shape="rectangle">
+            <corners android:radius="20dp" />
+            <solid android:color="#F20A0D12" />
+        </shape>
+    </item>
+</layer-list>

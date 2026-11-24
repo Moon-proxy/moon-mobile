@@ -1,0 +1,14 @@
+rust/target/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/androidMain/jniLibs/
+*.iml
+.idea/
+third_party/
+ios/build/
+ios/*.xcodeproj/
+ios/MoonMobile/Info.plist
+*.jks
+*.keystore

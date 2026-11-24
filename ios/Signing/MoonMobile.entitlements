@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The folder the app and its widget share. A free Apple ID's signature may not grant it,
+	     or grant it renamed; WidgetStore reads what was granted from the profile. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.app.moonmobile</string>
+	</array>
+</dict>
+</plist>

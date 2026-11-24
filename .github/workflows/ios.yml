@@ -1,0 +1,165 @@
+name: iOS build
+
+# An UNSIGNED .ipa of the app: the shared screens (android/app/src/commonMain) as a Kotlin
+# framework, the Rust bridge, and the Swift shell in ios/. The owner signs and installs it from his
+# Windows PC with Sideloadly and his own free Apple ID, so no Apple Developer Program, certificates
+# or secrets are involved yet.
+on:
+  push:
+    branches: [ios-poc]
+    paths:
+      - "ios/**"
+      - "rust/**"
+      - "android/app/src/commonMain/**"
+      - "android/app/src/iosMain/**"
+      - "patches/**"
+      - "scripts/fetch-moon-core.sh"
+      - ".github/workflows/ios.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ipa:
+    # macOS minutes count ten times against the account's free allowance: only this branch
+    # and manual runs build here.
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      # The oldest iOS the app runs on; the Rust library and the app agree on it.
+      IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: moon-core with patches
+        run: bash scripts/fetch-moon-core.sh
+
+      # rust/rust-toolchain.toml names the compiler; the iPhone target is added on top.
+      - name: Rust toolchain
+        working-directory: rust
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-ios
+          rustup show
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: ios
+
+      # A static library with the C entry points. rustc also prints the system libraries it
+      # needs; they become the app's linker flags, so nothing here is guessed by hand.
+      - name: Rust bridge (iPhone)
+        working-directory: rust
+        run: |
+          set -o pipefail
+          touch src/lib.rs
+          cargo rustc --release --locked --lib --target aarch64-apple-ios --features ffi \
+            --crate-type staticlib -- --print native-static-libs 2>&1 | tee ../rustc.log
+          libs=$(sed -n 's/.*native-static-libs: //p' ../rustc.log | tail -n 1)
+          echo "native libs: $libs"
+          mkdir -p ../ios/build/rust
+          cp target/aarch64-apple-ios/release/libmoonmobile.a ../ios/build/rust/
+          printf 'OTHER_LDFLAGS = $(inherited) -lmoonmobile %s\n' "$libs" > ../ios/build/rust.xcconfig
+          cat ../ios/build/rust.xcconfig
+          ls -la ../ios/build/rust/
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # The screens: the same Kotlin code as the Android app, linked for the iPhone.
+      - name: Kotlin framework
+        working-directory: android
+        run: bash ./gradlew --no-daemon :app:linkReleaseFrameworkIosArm64
+
+      # Pictures, sounds and the changelog come from the Android app, so both ship the same ones.
+      - name: Bundled files
+        run: |
+          mkdir -p ios/build/bundled/root ios/build/bundled/sounds
+          cp android/app/src/androidMain/res/drawable-nodpi/*.png ios/build/bundled/root/
+          cp android/app/src/androidMain/assets/changelog.txt ios/build/bundled/root/
+          cp android/app/src/androidMain/assets/sounds/* ios/build/bundled/sounds/
+          ls -la ios/build/bundled/root ios/build/bundled/sounds
+
+      # The Android build's version names the iOS one: v1.23b on both.
+      - name: Version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release list --limit 1 --json tagName --jq '.[0].tagName' || true)
+          echo "MM_VERSION_NAME=${tag#v}" >> "$GITHUB_ENV"
+          echo "Version: ${tag#v}"
+
+      - name: Xcode project
+        working-directory: ios
+        run: |
+          brew list xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen generate
+          xcodebuild -version
+
+      - name: App
+        working-directory: ios
+        run: |
+          xcodebuild build \
+            -project MoonMobile.xcodeproj -scheme MoonMobile -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/dd \
+            CURRENT_PROJECT_VERSION="${{ github.run_number }}" \
+            MM_BUILD_LABEL="iOS" \
+            MM_VERSION_NAME="$MM_VERSION_NAME" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            -quiet
+
+      # Ad-hoc signatures that carry the entitlements — the App Group the app and its widget
+      # share: an unsigned bundle has none for Sideloadly to read when it signs with the owner's
+      # Apple ID. Inner code first, as codesign checks it.
+      - name: Entitlements
+        run: |
+          app=ios/build/dd/Build/Products/Release-iphoneos/MoonMobile.app
+          widget="$app/PlugIns/MoonWidget.appex"
+          test -f "$widget/MoonWidget" || { echo "::error::the widget is not inside the app"; exit 1; }
+          for fw in "$app"/Frameworks/*.framework; do codesign --force --sign - "$fw"; done
+          codesign --force --sign - --entitlements ios/Signing/MoonWidget.entitlements "$widget"
+          codesign --force --sign - --entitlements ios/Signing/MoonMobile.entitlements "$app"
+          codesign -d --entitlements - "$widget"
+          codesign -d --entitlements - "$app"
+          plutil -p "$widget/Info.plist"
+
+      # What dyld needs at launch: the framework inside the app, and the app looking for it there.
+      - name: Check the app
+        run: |
+          app=ios/build/dd/Build/Products/Release-iphoneos/MoonMobile.app
+          kit="$app/Frameworks/MoonMobileKit.framework"
+          ls -la "$app" "$app/Frameworks" || true
+          test -f "$kit/MoonMobileKit" || { echo "::error::MoonMobileKit.framework is not inside the app"; exit 1; }
+          otool -L "$app/MoonMobile"
+          otool -l "$app/MoonMobile" | grep -A2 LC_RPATH || echo "::warning::the app has no LC_RPATH"
+          otool -L "$kit/MoonMobileKit"
+          otool -l "$kit/MoonMobileKit" | grep -A5 -E 'LC_ID_DYLIB|LC_BUILD_VERSION'
+          plutil -p "$kit/Info.plist"
+          echo "kfun symbols: $(nm "$kit/MoonMobileKit" | grep -c 'kfun:' || true)"
+
+      # An .ipa is the .app inside a Payload folder, zipped.
+      - name: IPA
+        run: |
+          app=ios/build/dd/Build/Products/Release-iphoneos/MoonMobile.app
+          plutil -p "$app/Info.plist"
+          mkdir -p out/Payload
+          cp -R "$app" out/Payload/
+          name="MoonMobile-ios-${MM_VERSION_NAME:-dev}-${{ github.run_number }}.ipa"
+          (cd out && zip -qry "$name" Payload)
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MoonMobile-ios-${{ github.run_number }}
+          path: out/*.ipa
+          if-no-files-found: error

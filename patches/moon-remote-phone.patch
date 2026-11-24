@@ -1,0 +1,116 @@
+diff --git a/crates/moon-remote/Cargo.toml b/crates/moon-remote/Cargo.toml
+index 98ea9a3..3d82ec3 100644
+--- a/crates/moon-remote/Cargo.toml
++++ b/crates/moon-remote/Cargo.toml
+@@ -5,6 +5,11 @@ edition = "2021"
+ description = "Prepares a Linux server for moon-station over SSH: an administrator reached by the terminal's own key, a closed server, a service user, core keys as systemd credentials."
+ publish = false
+ 
++[features]
++default = ["desktop"]
++# The OS keyring behind the app key's seal; a phone gives its key through `app_key::inject`.
++desktop = ["moon-core/desktop"]
++
+ [[bin]]
+ name = "moon-remote"
+ path = "src/main.rs"
+@@ -12,7 +17,7 @@ path = "src/main.rs"
+ [dependencies]
+ # With `desktop`: the terminal's machine key (OS keyring) seals the app's SSH key, and the core
+ # keys come from the terminal's own `servers.enc`.
+-moon-core = { path = "../moon-core" }
++moon-core = { path = "../moon-core", default-features = false }
+ anyhow = "1"
+ log = "0.4"
+ serde = { version = "1", features = ["derive"] }
+diff --git a/crates/moon-remote/src/app_key.rs b/crates/moon-remote/src/app_key.rs
+index 2e3317c..763fa2e 100644
+--- a/crates/moon-remote/src/app_key.rs
++++ b/crates/moon-remote/src/app_key.rs
+@@ -12,8 +12,30 @@ use russh::keys::ssh_key::LineEnding;
+ use russh::keys::ssh_key::private::{Ed25519Keypair, KeypairData};
+ use zeroize::Zeroizing;
+ 
++/// The app key a host without an OS keyring keeps itself (the phone, in its keystore) and hands
++/// in for its session, in OpenSSH form; it stands in for the sealed file.
++static INJECTED: std::sync::Mutex<Option<Zeroizing<String>>> = std::sync::Mutex::new(None);
++
++/// Use `openssh` as the app key from now on; `None` goes back to the sealed file.
++pub fn inject(openssh: Option<&str>) -> anyhow::Result<()> {
++    if let Some(text) = openssh {
++        PrivateKey::from_openssh(text).context("parse the app key")?;
++    }
++    *INJECTED.lock().unwrap_or_else(|e| e.into_inner()) = openssh.map(|t| Zeroizing::new(t.to_owned()));
++    Ok(())
++}
++
++/// A new app key in OpenSSH form, for a host that keeps it itself ([`inject`]).
++pub fn generate_openssh(comment: &str) -> anyhow::Result<Zeroizing<String>> {
++    let key = generate_named(comment.to_owned())?;
++    Ok(key.to_openssh(LineEnding::LF).context("encode the app key")?)
++}
++
+ /// Load the app key, or create and seal a new one.
+ pub fn load_or_create() -> anyhow::Result<PrivateKey> {
++    if let Some(text) = INJECTED.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
++        return PrivateKey::from_openssh(text.as_str()).context("parse the app key");
++    }
+     let path = moon_core::config::paths::remote_dir().join("app_key.enc");
+     match std::fs::read(&path) {
+         Ok(sealed) => {
+@@ -46,11 +68,15 @@ pub fn authorized_line(key: &PrivateKey) -> anyhow::Result<String> {
+ }
+ 
+ fn generate() -> anyhow::Result<PrivateKey> {
+-    let mut seed = Zeroizing::new([0u8; 32]);
+-    getrandom::getrandom(&mut *seed).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
+-    let pair = KeypairData::from(Ed25519Keypair::from_seed(&seed));
+     let machine = std::env::var("COMPUTERNAME")
+         .or_else(|_| std::env::var("HOSTNAME"))
+         .unwrap_or_else(|_| "host".to_owned());
+-    PrivateKey::new(pair, format!("moonterminal@{machine}")).context("build the app key")
++    generate_named(format!("moonterminal@{machine}"))
++}
++
++fn generate_named(comment: String) -> anyhow::Result<PrivateKey> {
++    let mut seed = Zeroizing::new([0u8; 32]);
++    getrandom::getrandom(&mut *seed).map_err(|e| anyhow::anyhow!("getrandom: {e}"))?;
++    let pair = KeypairData::from(Ed25519Keypair::from_seed(&seed));
++    PrivateKey::new(pair, comment).context("build the app key")
+ }
+diff --git a/crates/moon-remote/src/main.rs b/crates/moon-remote/src/main.rs
+index 468c0bc..e134953 100644
+--- a/crates/moon-remote/src/main.rs
++++ b/crates/moon-remote/src/main.rs
+@@ -121,6 +121,7 @@ fn run() -> anyhow::Result<()> {
+                     .map(Zeroizing::new),
+                 station,
+                 host_key,
++                check_only: false,
+             };
+             if let Err(e) = setup::run(&setup, &mut say) {
+                 if matches!(
+diff --git a/crates/moon-remote/src/setup.rs b/crates/moon-remote/src/setup.rs
+index 696baa6..b8b3400 100644
+--- a/crates/moon-remote/src/setup.rs
++++ b/crates/moon-remote/src/setup.rs
+@@ -89,6 +89,9 @@ pub struct Setup {
+     /// The host key fingerprint the user confirmed ([`probe_host_key`]); `None` when nothing was
+     /// confirmed. A server not pinned yet is never logged into without it.
+     pub host_key: Option<String>,
++    /// Log in and read the server, then stop: nothing on it changes and nothing is pinned. The
++    /// probe's report (the firewall's state and the ports it would close) goes to `say`.
++    pub check_only: bool,
+ }
+ 
+ /// The key a server presents, shown to the user before anything is sent to it.
+@@ -223,6 +226,9 @@ pub fn run(setup: &Setup, say: &mut dyn FnMut(Progress)) -> anyhow::Result<()> {
+     if ufw_before != "active" {
+         say_closing_ports(&probe, say);
+     }
++    if setup.check_only {
++        return Ok(());
++    }
+     if pinned.as_deref() != Some(pin.as_str()) {
+         // The stale pin of a setup that never finished gives way to the key the user confirmed.
+         hosts.forget(&addr);
