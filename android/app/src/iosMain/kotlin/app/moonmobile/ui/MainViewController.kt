@@ -27,10 +27,12 @@ fun MainViewController(host: IosHost): UIViewController {
 fun appWentAway() {
     AppLock.onAway()
     Session.uiVisible = false
+    Session.screenLine(visible = false, memoryMb = null)
 }
 
 /** The app came back to the screen. */
 fun appCameBack() {
     AppLock.onBack()
     Session.uiVisible = true
+    Session.screenLine(visible = true, memoryMb = null)
 }
