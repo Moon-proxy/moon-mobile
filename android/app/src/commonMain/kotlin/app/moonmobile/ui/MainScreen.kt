@@ -463,6 +463,8 @@ private fun CoresTab(
     }
     var addingCore by remember { mutableStateOf(false) }
     if (addingCore) AddCoreDialog(snapshot) { addingCore = false }
+    var accountsOpen by remember { mutableStateOf(false) }
+    if (accountsOpen) AccountsDialog(hidden) { accountsOpen = false }
     val opened = if (byServer) openServers else openExchanges
     val toggle: (String) -> Unit = { key ->
         if (byServer) {
@@ -475,7 +477,7 @@ private fun CoresTab(
     }
 
     ListGrid(contentPadding = PaddingValues(12.dp), spacing = 10.dp) { columns ->
-        wide(key = "total") { TotalCard(snapshot.total, hidden, onToggleHidden) }
+        wide(key = "total") { TotalCard(snapshot.total, hidden, onToggleHidden) { accountsOpen = true } }
         wide(key = "bar") {
             Row(
                 modifier = Modifier
@@ -813,9 +815,12 @@ private fun RenameServerDialog(host: String, current: String, onDismiss: () -> U
 /** What a hidden amount is drawn as. */
 private const val MASKED = "••••••"
 
-/** Every account together, with the eye that hides all balances on this screen. */
+/**
+ * Every account together, with the eye that hides all balances on this screen. A tap on the sum
+ * opens each exchange account with what it holds.
+ */
 @Composable
-private fun TotalCard(total: Total, hidden: Boolean, onToggle: () -> Unit) {
+private fun TotalCard(total: Total, hidden: Boolean, onToggle: () -> Unit, onOpen: () -> Unit) {
     Card(
         colors = CardDefaults.cardColors(containerColor = Palette.surfaceHigh),
         modifier = Modifier.fillMaxWidth(),
@@ -824,7 +829,7 @@ private fun TotalCard(total: Total, hidden: Boolean, onToggle: () -> Unit) {
             modifier = Modifier.padding(start = 14.dp, top = 10.dp, bottom = 10.dp, end = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Column(modifier = Modifier.weight(1f)) {
+            Column(modifier = Modifier.weight(1f).clickable(onClick = onOpen)) {
                 Text("Общий баланс", style = MaterialTheme.typography.labelLarge, color = Palette.textDim)
                 val sum = total.total
                 Text(

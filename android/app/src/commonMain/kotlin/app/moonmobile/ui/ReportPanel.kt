@@ -74,6 +74,8 @@ internal data class ReportRow(
     val currency: String,
     val volume: Double?,
     val reason: String,
+    /** The row's key in the list, unique: set by [withKeys]. */
+    val key: String = "",
 )
 
 /** The figures over the whole period. */
@@ -156,6 +158,21 @@ private fun parseTotals(json: JSONObject?): ReportTotals? {
         maxLoss = json.num("max_loss_usdt"),
         unvalued = json.optLong("unvalued"),
     )
+}
+
+/**
+ * The rows with a key each, unique even where two trades read alike (parts of one position sold
+ * at the same moment): the second of a kind gets a number. Earlier rows keep their keys when a
+ * page is added below them.
+ */
+internal fun withKeys(rows: List<ReportRow>): List<ReportRow> {
+    val seen = HashMap<String, Int>()
+    return rows.map { row ->
+        val base = "${row.core}:${row.closeMs}:${row.openMs}:${row.coin}:${row.buy}"
+        val count = seen[base] ?: 0
+        seen[base] = count + 1
+        row.copy(key = if (count == 0) base else "$base#$count")
+    }
 }
 
 /** `+4.00$`, `-12.50$`, `+1.2K$`. */
@@ -250,7 +267,7 @@ internal fun ReportPanel(
         }
         error = null
         val page = parseRows(reply.json)
-        rows = if (offset == 0) page else rows + page
+        rows = withKeys(if (offset == 0) page else rows + page)
         totals = parseTotals(reply.json.optJSONObject("totals"))
         hasMore = reply.json.optBoolean("has_more", false)
         reply.json.optJSONArray("strategies")?.let { strategies = parseStrategies(it) }
@@ -390,7 +407,9 @@ internal fun ReportPanel(
             contentPadding = PaddingValues(start = 6.dp, end = 6.dp, bottom = 6.dp),
             verticalArrangement = Arrangement.spacedBy(2.dp),
         ) {
-            items(rows, key = { "${it.core}:${it.closeMs}:${it.openMs}:${it.coin}:${it.buy}" }) { row ->
+            // The key comes with the row (withKeys): a key twice in a lazy list ends the app, and
+            // a list of keys apart from the rows can lag behind them.
+            items(rows, key = { it.key }) { row ->
                 TradeRow(row, byId[row.core]) {
                     if (row.market.isNotEmpty()) {
                         onPick(row.core, row.market)
