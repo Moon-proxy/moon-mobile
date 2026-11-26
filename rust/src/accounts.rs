@@ -1,14 +1,13 @@
 //! The total balance taken apart: one entry per exchange account, its wallets and what they hold.
 //!
 //! Several cores often trade on one exchange account, and each of them reports the whole
-//! account — its balance, its coins and its positions. A plain list per core would show that
-//! money once per core. The cores are grouped here the way the total folds them
-//! (`moon_core::session::balances`): by the account's identity the exchange gave each core in
-//! `AuthCheck`, and the wallet where spot and futures keep apart. Each account is shown once, with
-//! the balance of the core the total counts (the largest reading of the group), so the entries
-//! add up to the total on the Cores screen. Its coins and positions come from that core first;
-//! another live core of the account only adds what the first did not list, so nothing appears
-//! twice.
+//! account's wallets. A plain list per core would show that money once per core. The cores are
+//! grouped here the way the total folds them (`moon_core::session::balances`): by the account's
+//! identity the exchange gave each core in `AuthCheck`, and the wallet where spot and futures keep
+//! apart. Each wallet is shown once, with the coins it holds — the exchange's own wallet list,
+//! which one core of the wallet asks for — so nothing appears twice. A coin in an open order is
+//! counted where the order holds it: a buy holds the quote coin, a sell the coin sold; the order
+//! itself is not listed. A wallet is worth what its coins are, USDT and USDC at one dollar.
 //!
 //! The wallets are then gathered into the exchange account they belong to — Binance by the
 //! account's uid, other exchanges by their account id or address, as each core stated it — so one
@@ -36,7 +35,7 @@ static ASKED: Mutex<Option<HashMap<CoreId, Instant>>> = Mutex::new(None);
 
 #[derive(Serialize)]
 pub struct AccountsDto {
-    /// The same sum as the Cores screen's total.
+    /// What all the accounts below hold together, USDT and USDC at one dollar.
     pub total: Option<f64>,
     /// Exchange accounts: by exchange name, then by the account's number on that exchange.
     pub accounts: Vec<ExchangeAccountDto>,
@@ -76,48 +75,23 @@ pub struct WalletDto {
     /// `live`, `stale` (from before a lost connection), `awaiting` or `unpriced`.
     pub state: &'static str,
     pub total: Option<f64>,
-    /// Coins and positions, largest first.
+    /// The coins it holds, largest first.
     pub assets: Vec<AssetDto>,
     /// Holdings under [`DUST_USDT`] or with no price: how many, and what the priced ones are worth.
     pub small_count: u32,
     pub small_usdt: f64,
-    /// The cores' orders standing on the exchange's book, largest first. Their funds are already
-    /// in the wallet's total: an order only holds part of it.
-    pub orders: Vec<BookOrderDto>,
 }
 
-/// An order standing on the book: an entry not filled yet, or the take of a position.
-#[derive(Serialize)]
-pub struct BookOrderDto {
-    pub coin: String,
-    pub market: String,
-    /// `buy` or `sell`, as the order stands on the book.
-    pub side: &'static str,
-    /// `entry` (opens a position) or `take` (closes one).
-    pub leg: &'static str,
-    /// Coins still to trade.
-    pub amount: f64,
-    pub price: f64,
-    /// `amount × price`, in [`Self::quote`].
-    pub value: f64,
-    pub quote: String,
-}
 
 #[derive(Serialize)]
 pub struct AssetDto {
-    /// `coin` (a held coin), `cash` (the account's own currency) or `position`.
+    /// `coin` (a held coin) or `cash` (the account's own currency).
     pub kind: &'static str,
     pub coin: String,
-    /// The market, for a position.
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub market: String,
-    /// Coins held, or the position's size in coins.
+    /// The whole amount, what stands in orders included.
     pub amount: f64,
-    /// Worth in USDT: the holding, or the position's notional. `None` with no price.
+    /// Worth in USDT; `None` with no price.
     pub value: Option<f64>,
-    /// `long` or `short`, for a position.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub side: Option<&'static str>,
 }
 
 struct Member {
@@ -194,7 +168,11 @@ pub fn accounts(session: &SessionManager, config: &AppConfig, refresh: bool) -> 
         wallets.push((owner, kept.id, wallet(session, &ordered, refresh)));
     }
 
-    AccountsDto { total: sum.total, accounts: gather(session, wallets), excluded }
+    let accounts = gather(session, wallets);
+    // What the accounts here hold together; the Cores screen's total counts the cores' own figures.
+    let totals: Vec<f64> = accounts.iter().filter_map(|a| a.total).collect();
+    let total = if totals.is_empty() { sum.total } else { Some(totals.iter().sum()) };
+    AccountsDto { total, accounts, excluded }
 }
 
 /// The exchange account a core trades, by the same field the total folds it by: the uid on
@@ -332,85 +310,20 @@ fn wallet(session: &SessionManager, members: &[&Member], refresh: bool) -> Walle
     let usable = kept.figures.usable();
 
     if refresh {
-        // The spot cores' wallet lists: some exchanges list bought coins only there.
-        for member in members.iter().filter(|m| m.figures.state == BalanceState::Live) {
-            if matches!(resolved_kind(session, member.id), Some(MarketKind::Spot)) {
-                ask_wallets(session, member.id);
-                break;
-            }
+        // The wallet lists: what the exchange holds in each wallet, coins in orders included.
+        // One live core of the wallet is enough; all of them would answer the same.
+        if let Some(member) = members.iter().find(|m| m.figures.state == BalanceState::Live) {
+            ask_wallets(session, member.id);
         }
     }
 
-    // The counted core's holdings first; another live core of the account adds only what is
-    // missing. A coin is one entry however many markets list it; a position one per market and
-    // side.
-    let mut assets: Vec<AssetDto> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (at, member) in members.iter().enumerate() {
-        if at > 0 && member.figures.state != BalanceState::Live {
-            continue;
-        }
-        let Some(data) = store.core(member.id) else { continue };
-        let base = data.assets.base_currency.trim().to_ascii_uppercase();
-        let futures = data.assets.futures_account;
-        let coin_margined = futures && matches!(resolved_kind(session, member.id), Some(MarketKind::Quarterly));
-        for row in &data.assets.rows {
-            if row.pos_size != 0.0 && row.pos_size.is_finite() {
-                let side = if row.pos_size < 0.0 { "short" } else { "long" };
-                if !seen.insert(format!("pos:{}:{side}", row.market)) {
-                    continue;
-                }
-                let price = if row.mark_price > 0.0 { row.mark_price } else { row.price };
-                let notional = row.pos_size.abs() * price;
-                assets.push(AssetDto {
-                    kind: "position",
-                    coin: row.coin.clone(),
-                    market: row.market.clone(),
-                    amount: row.pos_size.abs(),
-                    value: (notional.is_finite() && notional > 0.0).then_some(notional),
-                    side: Some(side),
-                });
-                continue;
-            }
-            // A futures account's balances are its margin, not coins bought; a coin-margined one
-            // holds its margin in coins, which are its assets.
-            if futures && !coin_margined {
-                continue;
-            }
-            let amount = row.qty_full.abs().max(row.qty.abs());
-            if row.coin.is_empty() || !(amount > 0.0) || !seen.insert(format!("coin:{}", row.coin.to_ascii_uppercase())) {
-                continue;
-            }
-            let cash = row.is_quote_asset || row.coin.eq_ignore_ascii_case(&base);
-            assets.push(AssetDto {
-                kind: if cash { "cash" } else { "coin" },
-                coin: row.coin.clone(),
-                market: String::new(),
-                amount,
-                value: (row.value_usdt.is_finite() && row.value_usdt > 0.0).then_some(row.value_usdt),
-                side: None,
-            });
-        }
-        if !futures {
-            // Coins some exchanges list only in the wallet, not per market.
-            for wallet in &data.transfer_assets.spot {
-                let coin = wallet.currency.to_ascii_uppercase();
-                if coin.is_empty() || !(wallet.total.abs() > 0.0) || !seen.insert(format!("coin:{coin}")) {
-                    continue;
-                }
-                assets.push(AssetDto {
-                    kind: if coin == base { "cash" } else { "coin" },
-                    coin: wallet.currency.clone(),
-                    market: String::new(),
-                    amount: wallet.total.abs(),
-                    value: (wallet.value_usdt.is_finite() && wallet.value_usdt > 0.0).then_some(wallet.value_usdt),
-                    side: None,
-                });
-            }
-        }
-    }
-    // Positions and the account's own currency always show; a coin worth under a dollar, or with
-    // no price, is counted among the small ones.
+    let assets = wallet_assets(session, members, kind);
+    // The wallet is worth what its coins are; while none has a price, what the core says.
+    let priced: Vec<f64> = assets.iter().filter_map(|a| a.value).collect();
+    let total = if priced.is_empty() { usable.then_some(kept.figures.total) } else { Some(priced.iter().sum()) };
+    let mut assets = assets;
+    // The account's own currency always shows; a coin worth under a dollar, or with no price, is
+    // counted among the small ones.
     let mut small_count = 0u32;
     let mut small_usdt = 0.0;
     assets.retain(|a| {
@@ -424,12 +337,11 @@ fn wallet(session: &SessionManager, members: &[&Member], refresh: bool) -> Walle
     assets.sort_by(|a, b| b.value.unwrap_or(-1.0).total_cmp(&a.value.unwrap_or(-1.0)));
 
     WalletDto {
-        orders: book_orders(session, members),
         kind,
         currency,
         cores: members.iter().map(|m| m.name.clone()).collect(),
         state,
-        total: usable.then_some(kept.figures.total),
+        total,
         assets,
         small_count,
         small_usdt,
@@ -440,49 +352,96 @@ fn resolved_kind(session: &SessionManager, core: CoreId) -> Option<MarketKind> {
     session.core_venues().get(&core).and_then(|v| v.resolved()).map(|r| r.kind)
 }
 
-/// The orders every core of the wallet has standing on the book. Each core reports only its own
-/// orders, so they add up without repeats. An entry stands while the core says `BuySet`, for the
-/// part not filled yet; a take while it says `SellSet`, for what remains to sell. An emulated
-/// order, one waiting on its condition and one already done are not on the book.
-fn book_orders(session: &SessionManager, members: &[&Member]) -> Vec<BookOrderDto> {
+/// Coins valued at one dollar whatever the market says.
+fn stable(coin: &str) -> bool {
+    coin.eq_ignore_ascii_case("USDT") || coin.eq_ignore_ascii_case("USDC")
+}
+
+/// What a wallet holds, one line per coin with its full amount — what stands in orders included,
+/// in the coin the order holds (a buy holds the quote coin, a sell the coin sold) — and its worth
+/// in USDT, USDT and USDC at one dollar.
+///
+/// The exchange's own wallet list comes first: the core asks the exchange, and the list has every
+/// coin of the wallet with its total. Until a core of the wallet has one, the core's figures stand
+/// in: on spot its coins and its own currency (free and in orders), on futures the margin currency
+/// without the open positions' result, on coin-margined futures the coins.
+fn wallet_assets(session: &SessionManager, members: &[&Member], kind: &str) -> Vec<AssetDto> {
     let store = session.store();
-    let mut orders = Vec::new();
+    let line = |coin: &str, base: &str, amount: f64, value_usdt: f64| AssetDto {
+        kind: if coin.eq_ignore_ascii_case(base) { "cash" } else { "coin" },
+        coin: coin.to_string(),
+        amount,
+        value: if stable(coin) {
+            Some(amount)
+        } else {
+            (value_usdt.is_finite() && value_usdt > 0.0).then_some(value_usdt)
+        },
+    };
+
+    // The exchange's list, from the first core of the wallet that has one.
     for member in members {
         let Some(data) = store.core(member.id) else { continue };
-        for order in &data.orders {
-            if order.job_is_done || order.emulator || order.pending {
+        let lists = &data.transfer_assets;
+        let rows: Vec<&moon_core::feed::TransferAssetRow> = match kind {
+            "spot" => lists.spot.iter().collect(),
+            "futures" => lists.futures.iter().collect(),
+            "quarterly" => lists.quarterly.iter().collect(),
+            _ => lists.spot.iter().chain(&lists.futures).chain(&lists.quarterly).collect(),
+        };
+        if rows.iter().all(|r| !(r.total.abs() > 0.0)) {
+            continue;
+        }
+        let base = data.assets.base_currency.trim().to_ascii_uppercase();
+        // One line per coin; a wallet shared by spot and futures may list a coin in both.
+        let mut by_coin: Vec<AssetDto> = Vec::new();
+        for row in rows {
+            let amount = row.total.abs();
+            let coin = row.currency.trim().to_ascii_uppercase();
+            if coin.is_empty() || !(amount > 0.0) {
                 continue;
             }
-            let (leg, amount, price) = match order.status.as_str() {
-                "BuySet" => {
-                    let left = order.size * (1.0 - f64::from(order.fill_pct).clamp(0.0, 100.0) / 100.0);
-                    ("entry", left, order.buy_price)
-                }
-                "SellSet" => {
-                    let left = if order.remaining_size > 0.0 { order.remaining_size } else { order.size };
-                    ("take", left, order.sell_price)
-                }
-                _ => continue,
-            };
-            if !(amount > 0.0 && price > 0.0 && amount.is_finite() && price.is_finite()) {
+            match by_coin.iter_mut().find(|a| a.coin == coin) {
+                Some(seen) if seen.amount >= amount => {}
+                Some(seen) => *seen = line(&coin, &base, amount, row.value_usdt),
+                None => by_coin.push(line(&coin, &base, amount, row.value_usdt)),
+            }
+        }
+        return by_coin;
+    }
+
+    // No list yet: the counted core's own figures.
+    let Some(data) = store.core(members[0].id) else { return Vec::new() };
+    let base = data.assets.base_currency.trim().to_ascii_uppercase();
+    let global = &data.assets.global;
+    let mut assets: Vec<AssetDto> = Vec::new();
+    if kind == "quarterly" {
+        for row in &data.assets.rows {
+            let amount = row.qty_full.abs().max(row.qty.abs());
+            let coin = row.coin.trim().to_ascii_uppercase();
+            if coin.is_empty() || !(amount > 0.0) || assets.iter().any(|a| a.coin == coin) {
                 continue;
             }
-            // A long buys to enter and sells to take; a short the other way round.
-            let buys = (leg == "entry") != order.is_short;
-            orders.push(BookOrderDto {
-                coin: order.coin.clone(),
-                market: order.market.clone(),
-                side: if buys { "buy" } else { "sell" },
-                leg,
-                amount,
-                price,
-                value: amount * price,
-                quote: order.quote.clone(),
-            });
+            assets.push(line(&coin, &base, amount, row.value_usdt));
+        }
+        return assets;
+    }
+    if kind != "futures" {
+        for row in &data.assets.rows {
+            let amount = row.qty_full.abs().max(row.qty.abs());
+            let coin = row.coin.trim().to_ascii_uppercase();
+            if coin.is_empty() || coin == base || row.is_quote_asset || !(amount > 0.0) || assets.iter().any(|a| a.coin == coin) {
+                continue;
+            }
+            assets.push(line(&coin, &base, amount, row.value_usdt));
         }
     }
-    orders.sort_by(|a, b| b.value.total_cmp(&a.value));
-    orders
+    // The account's own currency: free and held in orders, without the open positions' result.
+    let cash = global.btc_total.max(0.0) + global.btc_locked.max(0.0);
+    if !base.is_empty() && cash > 0.0 && cash.is_finite() {
+        let rate = if global.btc_full > 0.0 && global.total_usdt > 0.0 { global.total_usdt / global.btc_full } else { 0.0 };
+        assets.push(line(&base, &base, cash, cash * rate));
+    }
+    assets
 }
 
 /// Ask a core for its wallet list, at most every [`REFRESH_EVERY`].

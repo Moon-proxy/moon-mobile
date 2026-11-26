@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -37,31 +36,14 @@ import app.moonmobile.json.JSONArray
 import app.moonmobile.json.JSONObject
 import kotlinx.coroutines.delay
 
-/** One coin or position of a wallet. */
+/** One coin of a wallet: its whole amount, what stands in orders included, and its worth. */
 internal data class WalletAsset(
-    /** `coin`, `cash` (the wallet's own currency) or `position`. */
+    /** `coin`, or `cash` for the wallet's own currency. */
     val kind: String,
     val coin: String,
-    val market: String,
     val amount: Double,
+    /** In USDT; USDT and USDC at one dollar. */
     val value: Double?,
-    /** `long` or `short`, for a position. */
-    val side: String?,
-)
-
-/** An order standing on the exchange's book: an entry not filled yet, or a position's take. */
-internal data class BookOrder(
-    val coin: String,
-    val market: String,
-    /** `buy` or `sell`, as it stands on the book. */
-    val side: String,
-    /** `entry` or `take`. */
-    val leg: String,
-    val amount: Double,
-    val price: Double,
-    /** `amount × price`, in [quote]. */
-    val value: Double,
-    val quote: String,
 )
 
 /** One wallet of an exchange account: spot, futures, coin-margined, or a single shared one. */
@@ -75,7 +57,6 @@ internal data class Wallet(
     val assets: List<WalletAsset>,
     val smallCount: Int,
     val smallUsdt: Double,
-    val orders: List<BookOrder>,
 )
 
 /** One exchange account, however many cores trade on it, with its wallets. */
@@ -126,26 +107,12 @@ internal fun parseAccounts(json: JSONObject): Accounts {
                         WalletAsset(
                             kind = r.optString("kind"),
                             coin = r.optString("coin"),
-                            market = r.optString("market"),
                             amount = r.num("amount") ?: 0.0,
                             value = r.num("value"),
-                            side = r.optString("side").takeIf { it.isNotBlank() },
                         )
                     },
                     smallCount = w.optInt("small_count"),
                     smallUsdt = w.num("small_usdt") ?: 0.0,
-                    orders = w.optJSONArray("orders").objects().map { o ->
-                        BookOrder(
-                            coin = o.optString("coin"),
-                            market = o.optString("market"),
-                            side = o.optString("side"),
-                            leg = o.optString("leg"),
-                            amount = o.num("amount") ?: 0.0,
-                            price = o.num("price") ?: 0.0,
-                            value = o.num("value") ?: 0.0,
-                            quote = o.optString("quote"),
-                        )
-                    },
                 )
             },
         )
@@ -180,10 +147,11 @@ private fun accountTitle(account: ExchangeAccount, name: String): String {
 private const val HIDDEN = "••••"
 
 /**
- * The total balance taken apart by exchange account: one block per account with the sum of all
- * its wallets; a tap opens its wallets (spot, futures…) with their coins and positions and what
- * they are worth, a long press names the account. Cores trading one account are one block (the
- * bridge groups them as the total does), so nothing is counted twice.
+ * The total balance taken apart by exchange account: one block per account with what all its
+ * wallets hold; a tap opens the wallets (spot, futures, coin-margined) with their coins — what
+ * stands in orders included — and what they are worth, a long press names the account. Cores
+ * trading one account are one block (the bridge groups them as the total does), so nothing is
+ * counted twice.
  */
 @Composable
 internal fun AccountsDialog(hidden: Boolean, onDismiss: () -> Unit) {
@@ -359,9 +327,9 @@ private fun WalletBlock(wallet: Wallet, hidden: Boolean, money: (Double?) -> Str
             "unpriced" -> "нет курса к USDT"
             else -> null
         }?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = Palette.amber) }
-        if (wallet.assets.isEmpty() && wallet.smallCount == 0 && wallet.orders.isEmpty()) {
+        if (wallet.assets.isEmpty() && wallet.smallCount == 0) {
             Text(
-                if (wallet.kind == "futures" || wallet.kind == "quarterly") "Открытых позиций нет" else "Монет нет",
+                "Пусто",
                 style = MaterialTheme.typography.labelMedium,
                 color = Palette.textDim,
             )
@@ -375,44 +343,6 @@ private fun WalletBlock(wallet: Wallet, hidden: Boolean, money: (Double?) -> Str
                 color = Palette.textDim,
             )
         }
-        if (wallet.orders.isNotEmpty()) {
-            Spacer(Modifier.height(4.dp))
-            Text(
-                "Ордера в стакане: ${wallet.orders.size}",
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = Palette.textDim,
-            )
-            for (order in wallet.orders) OrderLine(order, hidden)
-        }
-    }
-}
-
-/** An order on the book: coin, Buy or Sell, how much at what price, and what it is worth. */
-@Composable
-private fun OrderLine(order: BookOrder, hidden: Boolean) {
-    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Text(order.coin, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-        Spacer(Modifier.width(6.dp))
-        val buy = order.side == "buy"
-        Text(
-            if (buy) "Buy" else "Sell",
-            style = MaterialTheme.typography.labelMedium,
-            color = if (buy) Palette.green else Palette.red,
-        )
-        Spacer(Modifier.width(6.dp))
-        Text(
-            if (hidden) HIDDEN else "${formatPrice(order.amount)} × ${formatPrice(order.price)}",
-            style = MaterialTheme.typography.labelMedium,
-            color = Palette.textDim,
-            modifier = Modifier.weight(1f),
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
-        Text(
-            (if (hidden) HIDDEN else formatAmount(order.value)) + " " + order.quote.ifBlank { "$" },
-            style = MaterialTheme.typography.bodyMedium,
-        )
     }
 }
 
@@ -420,15 +350,6 @@ private fun OrderLine(order: BookOrder, hidden: Boolean) {
 private fun AssetLine(asset: WalletAsset, hidden: Boolean, money: (Double?) -> String) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Text(asset.coin, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
-        if (asset.kind == "position") {
-            Spacer(Modifier.width(6.dp))
-            val short = asset.side == "short"
-            Text(
-                if (short) "Short" else "Long",
-                style = MaterialTheme.typography.labelMedium,
-                color = if (short) Palette.red else Palette.green,
-            )
-        }
         Spacer(Modifier.width(6.dp))
         Text(
             if (hidden) HIDDEN else formatPrice(asset.amount),
