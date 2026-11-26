@@ -2422,6 +2422,10 @@ fn handle(
                 .map_err(|e| unavailable(e.to_string()))?;
             Ok(ok(json!({ "result": "sent" })))
         }
+        Call::Accounts { refresh } => {
+            let reply = crate::accounts::accounts(session, config, refresh);
+            Ok(ok(serde_json::to_value(reply).unwrap_or(Value::Null)))
+        }
         Call::JoinSells { core, market, short } => {
             online(session, config, core)?;
             let market = market.trim().to_string();

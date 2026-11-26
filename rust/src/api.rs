@@ -127,6 +127,12 @@ pub enum Call {
     CancelBuys { core: u64 },
     /// Cancel the buys of one market that have not filled yet: the chart's Cancel Buy.
     CancelMarketBuys { core: u64, market: String },
+    /// The total balance taken apart: each exchange account once, with its coins and positions.
+    /// With `refresh`, the counted spot cores are asked for their wallet list again.
+    Accounts {
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Join every sell of one market and side into one, at their average: the chart's Join.
     /// A LIVE exchange action.
     JoinSells { core: u64, market: String, short: bool },

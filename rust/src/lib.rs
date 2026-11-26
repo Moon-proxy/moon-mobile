@@ -5,6 +5,7 @@
 //! returns JSON text (shapes in [`api`]), so the same surface serves the Android app through JNI,
 //! the iOS app through C (`ffi`) and, later, a server gateway through a socket.
 
+mod accounts;
 mod alerts;
 mod station;
 pub mod api;
