@@ -137,9 +137,11 @@ pub(crate) fn export(data_dir: &str, from_ms: i64, to_ms: i64, out: &str) -> Api
     Ok(json!({ "ok": true, "lines": lines, "files": files.len(), "bytes": bytes }))
 }
 
-/// A line from the app itself (Kotlin side) into the same log.
+/// A line from the app itself (Kotlin side) into the same log. Its target is under `moonmobile`,
+/// which the log's filter lets through at info: a bare `app` fell under the filter's `warn` and
+/// every such line was dropped.
 pub(crate) fn app_line(text: &str) {
-    log::info!(target: "app", "{}", text.chars().take(2000).collect::<String>());
+    log::info!(target: "moonmobile::app", "{}", text.chars().take(4000).collect::<String>());
 }
 
 #[cfg(test)]

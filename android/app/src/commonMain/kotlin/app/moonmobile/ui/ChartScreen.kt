@@ -146,9 +146,6 @@ private const val CENTER_HOLD_MS = 5_000L
 /** After an order line is let go, this long passes before the picture moves again. */
 private const val LINE_DROP_HOLD_MS = 3_000L
 
-/** How long a take let go of stays the one Join and Split act on. */
-private const val JOIN_SELECT_MS = 4_000L
-
 /** How long a picked take % shows its levels on the chart. */
 private const val TAKE_FLASH_MS = 500L
 
@@ -311,15 +308,9 @@ private class ChartView(span: Long) {
     @Volatile
     var heldScale = 0.0
 
-    /**
-     * The order line last held on the book, for Join and Split: while it is held and
-     * [JOIN_SELECT_MS] after it is let go ([selectedUntil]).
-     */
+    /** The order line under the finger on the book, for Join and Split: from the touch until let go. */
     @Volatile
     var selected: LineHit? = null
-
-    @Volatile
-    var selectedUntil = 0L
 
     /** Holds the middle where it is for as long as the picture is held. */
     fun hold() {
@@ -561,7 +552,7 @@ internal fun ChartScreen(
      * average, or that sell in two at its price.
      */
     val joinOrSplit: (Boolean) -> Unit = { join ->
-        val held = view.selected?.takeIf { nowMs() <= view.selectedUntil && it.role == "exit" }
+        val held = view.selected?.takeIf { it.role == "exit" }
         if (held == null) {
             view.say("Удерживайте тейк на стакане и нажмите ${if (join) "Join" else "Split"}")
         } else {
@@ -1625,6 +1616,8 @@ private fun ChartCanvas(
                     // it moves, with a finger after holding still a moment. Wherever the pointer
                     // goes then, the line follows, and it is set where the pointer lets go.
                     val hit = if (view.inBook(down.position.x)) view.lineAt(down.position.y, reach) else null
+                    // Join and Split act on a take from the moment it is touched until it is let go.
+                    view.selected = hit
                     var released = false
                     var holding = false
                     if (hit != null && !mouse) {
@@ -1654,9 +1647,6 @@ private fun ChartCanvas(
                             haptics.performHapticFeedback(HapticFeedbackType.LongPress)
                             view.holdForLine()
                             view.drag = Dragged(hit, down.position.y)
-                            // Held: the line Join and Split act on, while held and a little after.
-                            view.selected = hit
-                            view.selectedUntil = Long.MAX_VALUE
                         }
                         var started = holding
                         var last = down.position
@@ -1674,7 +1664,6 @@ private fun ChartCanvas(
                                 change.consume()
                             }
                         }
-                        if (view.selected == hit) view.selectedUntil = nowMs() + JOIN_SELECT_MS
                         if (started) {
                             view.drag = null
                             val price = view.priceHeld(last.y)
@@ -1884,6 +1873,7 @@ private fun ChartCanvas(
                         else -> onHint("Удерживайте Short или Long и нажмите на стакан")
                     }
                     } finally {
+                        view.selected = null
                         if (view.touching) view.letGo()
                     }
                 }
@@ -2313,7 +2303,7 @@ private fun DetectPanel(
                     contentPadding = PaddingValues(5.dp),
                     verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
-                    items(alive, key = { "${it.core}:${it.market}" }) { card ->
+                    items(alive.distinctBy { "${it.core}:${it.market}" }, key = { "${it.core}:${it.market}" }) { card ->
                         DetectCard(
                             card = card,
                             secondsLeft = ((card.bornMs + card.ttlMs - now + 999L) / 1000L)
@@ -2980,7 +2970,7 @@ private fun PositionsPanel(
             contentPadding = PaddingValues(start = 6.dp, end = 6.dp, bottom = 6.dp),
             verticalArrangement = Arrangement.spacedBy(3.dp),
         ) {
-            items(positions, key = { "${it.core}:${it.uid}" }) { order ->
+            items(positions.distinctBy { "${it.core}:${it.uid}" }, key = { "${it.core}:${it.uid}" }) { order ->
                 val core = byId[order.core]
                 val selected = current == (order.core to order.market)
                 val pct = order.pnlPct
@@ -3074,7 +3064,7 @@ private fun PositionsPanel(
                     )
                 }
             }
-            items(placed, key = { "o:${it.core}:${it.uid}" }) { order ->
+            items(placed.distinctBy { "${it.core}:${it.uid}" }, key = { "o:${it.core}:${it.uid}" }) { order ->
                 val core = byId[order.core]
                 val selected = current == (order.core to order.market)
                 val key = "${order.core}:${order.uid}"
@@ -3476,7 +3466,8 @@ private fun PickGrid(
         horizontalArrangement = Arrangement.spacedBy(4.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
-        gridItems(rows, key = { "${it.core}:${it.market}" }) { row ->
+        // A key twice in a lazy list ends the app: a market a core lists twice is shown once.
+        gridItems(rows.distinctBy { "${it.core}:${it.market}" }, key = { "${it.core}:${it.market}" }) { row ->
             PickLine(row, cores[row.core], showCore, ranking = ranking, onPick = onPick)
         }
     }

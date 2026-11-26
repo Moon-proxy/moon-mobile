@@ -10,6 +10,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -315,6 +316,7 @@ object Session {
             // The logger is up now: apply the log-file switch and note the app's version.
             setLogFiles(app, AppPrefs.flag(app, "log_files", true))
             log("MoonMobile ${appVersion(app)}: подключение открыто")
+            for (line in waitingLines.getAndUpdate { emptyList() }) log(line)
             mutableState.update {
                 it.copy(phase = Phase.ONLINE, error = null, demo = demo, snapshot = null)
             }
@@ -433,6 +435,20 @@ object Session {
                 Platform.exitProcess()
             }
         }
+    }
+
+    /** Lines for the log from before the logger is up: written once the connection opens. */
+    private val waitingLines = MutableStateFlow<List<String>>(emptyList())
+
+    /** A line for the log that may come before the first connection of the process. */
+    fun logLater(text: String) {
+        waitingLines.update { it + text }
+    }
+
+    /** The app left the screen or came back to it: a line in the log, with the memory it holds. */
+    fun screenLine(visible: Boolean, memoryMb: Int?) {
+        val memory = memoryMb?.let { ", память $it МБ" }.orEmpty()
+        log(if (visible) "Приложение снова на экране$memory" else "Приложение свёрнуто$memory")
     }
 
     /** The installed app's version name, `1.10b`. */
