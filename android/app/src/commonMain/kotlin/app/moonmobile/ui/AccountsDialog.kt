@@ -1,11 +1,14 @@
 package app.moonmobile.ui
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
@@ -13,11 +16,13 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -26,14 +31,15 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import app.moonmobile.core.AppPrefs
 import app.moonmobile.core.Session
 import app.moonmobile.json.JSONArray
 import app.moonmobile.json.JSONObject
 import kotlinx.coroutines.delay
 
-/** One coin or position of an account. */
-internal data class AccountAsset(
-    /** `coin`, `cash` (the account's own currency) or `position`. */
+/** One coin or position of a wallet. */
+internal data class WalletAsset(
+    /** `coin`, `cash` (the wallet's own currency) or `position`. */
     val kind: String,
     val coin: String,
     val market: String,
@@ -41,30 +47,53 @@ internal data class AccountAsset(
     val value: Double?,
     /** `long` or `short`, for a position. */
     val side: String?,
-    val pnl: Double?,
 )
 
-/** One exchange account, however many cores trade on it. */
-internal data class AccountEntry(
-    val exchange: String,
-    val brand: String,
+/** An order standing on the exchange's book: an entry not filled yet, or a position's take. */
+internal data class BookOrder(
+    val coin: String,
+    val market: String,
+    /** `buy` or `sell`, as it stands on the book. */
+    val side: String,
+    /** `entry` or `take`. */
+    val leg: String,
+    val amount: Double,
+    val price: Double,
+    /** `amount × price`, in [quote]. */
+    val value: Double,
+    val quote: String,
+)
+
+/** One wallet of an exchange account: spot, futures, coin-margined, or a single shared one. */
+internal data class Wallet(
     val kind: String,
     val currency: String,
     val cores: List<String>,
     /** `live`, `stale`, `awaiting` or `unpriced`. */
     val state: String,
     val total: Double?,
-    val free: Double?,
-    val pnl: Double?,
-    val assets: List<AccountAsset>,
+    val assets: List<WalletAsset>,
     val smallCount: Int,
     val smallUsdt: Double,
+    val orders: List<BookOrder>,
+)
+
+/** One exchange account, however many cores trade on it, with its wallets. */
+internal data class ExchangeAccount(
+    /** Stable across launches, for the name the user gives it. */
+    val key: String,
+    val exchange: String,
+    val brand: String,
+    /** Its place among the exchange's accounts, from 1; 0 for the only one, or an unknown one. */
+    val number: Int,
+    val known: Boolean,
+    val total: Double?,
+    val wallets: List<Wallet>,
 )
 
 internal data class Accounts(
     val total: Double?,
-    val free: Double?,
-    val accounts: List<AccountEntry>,
+    val accounts: List<ExchangeAccount>,
     val excluded: List<String>,
 )
 
@@ -74,67 +103,107 @@ private fun JSONObject.num(key: String): Double? =
 private fun JSONArray?.strings(): List<String> =
     if (this == null) emptyList() else (0 until length()).map { optString(it) }.filter { it.isNotBlank() }
 
+private fun JSONArray?.objects(): List<JSONObject> =
+    if (this == null) emptyList() else (0 until length()).mapNotNull { optJSONObject(it) }
+
 internal fun parseAccounts(json: JSONObject): Accounts {
-    val list = json.optJSONArray("accounts")
-    val accounts = (0 until (list?.length() ?: 0)).mapNotNull { at ->
-        val o = list?.optJSONObject(at) ?: return@mapNotNull null
-        val rows = o.optJSONArray("assets")
-        AccountEntry(
-            exchange = o.optString("exchange"),
-            brand = o.optString("brand"),
-            kind = o.optString("kind"),
-            currency = o.optString("currency"),
-            cores = o.optJSONArray("cores").strings(),
-            state = o.optString("state"),
-            total = o.num("total"),
-            free = o.num("free"),
-            pnl = o.num("pnl"),
-            assets = (0 until (rows?.length() ?: 0)).mapNotNull { r ->
-                val a = rows?.optJSONObject(r) ?: return@mapNotNull null
-                AccountAsset(
-                    kind = a.optString("kind"),
-                    coin = a.optString("coin"),
-                    market = a.optString("market"),
-                    amount = a.num("amount") ?: 0.0,
-                    value = a.num("value"),
-                    side = a.optString("side").takeIf { it.isNotBlank() },
-                    pnl = a.num("pnl"),
+    val accounts = json.optJSONArray("accounts").objects().map { a ->
+        ExchangeAccount(
+            key = a.optString("key"),
+            exchange = a.optString("exchange"),
+            brand = a.optString("brand"),
+            number = a.optInt("number"),
+            known = a.optBoolean("known"),
+            total = a.num("total"),
+            wallets = a.optJSONArray("wallets").objects().map { w ->
+                Wallet(
+                    kind = w.optString("kind"),
+                    currency = w.optString("currency"),
+                    cores = w.optJSONArray("cores").strings(),
+                    state = w.optString("state"),
+                    total = w.num("total"),
+                    assets = w.optJSONArray("assets").objects().map { r ->
+                        WalletAsset(
+                            kind = r.optString("kind"),
+                            coin = r.optString("coin"),
+                            market = r.optString("market"),
+                            amount = r.num("amount") ?: 0.0,
+                            value = r.num("value"),
+                            side = r.optString("side").takeIf { it.isNotBlank() },
+                        )
+                    },
+                    smallCount = w.optInt("small_count"),
+                    smallUsdt = w.num("small_usdt") ?: 0.0,
+                    orders = w.optJSONArray("orders").objects().map { o ->
+                        BookOrder(
+                            coin = o.optString("coin"),
+                            market = o.optString("market"),
+                            side = o.optString("side"),
+                            leg = o.optString("leg"),
+                            amount = o.num("amount") ?: 0.0,
+                            price = o.num("price") ?: 0.0,
+                            value = o.num("value") ?: 0.0,
+                            quote = o.optString("quote"),
+                        )
+                    },
                 )
             },
-            smallCount = o.optInt("small_count"),
-            smallUsdt = o.num("small_usdt") ?: 0.0,
         )
     }
-    return Accounts(json.num("total"), json.num("free"), accounts, json.optJSONArray("excluded").strings())
+    return Accounts(json.num("total"), accounts, json.optJSONArray("excluded").strings())
 }
 
-private fun kindTitle(kind: String): String = when (kind) {
+private fun walletTitle(kind: String): String = when (kind) {
     "spot" -> "Спот"
     "futures" -> "Фьючерсы"
-    "quarterly" -> "Квартальные"
-    "unified" -> "единый счёт"
-    else -> ""
+    "quarterly" -> "Фьючерсы COIN-M"
+    "unified" -> "Единый счёт"
+    else -> "Счёт"
+}
+
+/** Where the names the user gives exchange accounts are kept, by the account's key. */
+private fun nameKey(account: ExchangeAccount) = "account_name:${account.key}"
+
+/** The account as listed: its exchange, then the user's name for it, or its number. */
+private fun accountTitle(account: ExchangeAccount, name: String): String {
+    val exchange = account.exchange.ifBlank { exchangeTitle(account.brand) }.ifBlank { "Биржа" }
+    val second = when {
+        name.isNotBlank() -> name
+        !account.known -> "аккаунт не определён"
+        account.number > 0 -> "аккаунт ${account.number}"
+        else -> ""
+    }
+    return if (second.isEmpty()) exchange else "$exchange · $second"
 }
 
 /** What a hidden amount is drawn as. */
 private const val HIDDEN = "••••"
 
 /**
- * The total balance taken apart: each exchange account once, with its balance, coins and
- * positions. Cores trading one account are one entry (the bridge groups them as the total does),
- * so nothing is counted twice and the entries add up to the total.
+ * The total balance taken apart by exchange account: one block per account with the sum of all
+ * its wallets; a tap opens its wallets (spot, futures…) with their coins and positions and what
+ * they are worth, a long press names the account. Cores trading one account are one block (the
+ * bridge groups them as the total does), so nothing is counted twice.
  */
 @Composable
 internal fun AccountsDialog(hidden: Boolean, onDismiss: () -> Unit) {
+    val context = platformContext()
     var accounts by remember { mutableStateOf<Accounts?>(null) }
     var failed by remember { mutableStateOf("") }
+    val open = remember { mutableStateMapOf<String, Boolean>() }
+    val names = remember { mutableStateMapOf<String, String>() }
+    var renaming by remember { mutableStateOf<ExchangeAccount?>(null) }
     LaunchedEffect(Unit) {
         var refresh = true
         while (true) {
             val reply = Session.call(JSONObject().put("op", "accounts").put("refresh", refresh))
             refresh = false
             if (reply.ok) {
-                accounts = parseAccounts(reply.json)
+                val parsed = parseAccounts(reply.json)
+                for (account in parsed.accounts) {
+                    if (account.key !in names) names[account.key] = AppPrefs.text(context, nameKey(account), "")
+                }
+                accounts = parsed
                 failed = ""
             } else if (accounts == null) {
                 failed = reply.message.ifBlank { "Нет ответа" }
@@ -155,7 +224,7 @@ internal fun AccountsDialog(hidden: Boolean, onDismiss: () -> Unit) {
             val data = accounts
             Column(
                 modifier = Modifier.heightIn(max = 560.dp).verticalScroll(rememberScrollState()),
-                verticalArrangement = Arrangement.spacedBy(10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 when {
                     data == null && failed.isNotEmpty() -> Text(failed, color = Palette.red)
@@ -170,14 +239,17 @@ internal fun AccountsDialog(hidden: Boolean, onDismiss: () -> Unit) {
                                 fontWeight = FontWeight.SemiBold,
                             )
                         }
-                        if (data.free != null && !hidden) {
-                            Text(
-                                "свободно ${formatAmount(data.free)} USDT",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = Palette.textDim,
+                        for (account in data.accounts) {
+                            AccountBlock(
+                                account = account,
+                                title = accountTitle(account, names[account.key].orEmpty()),
+                                expanded = open[account.key] == true,
+                                hidden = hidden,
+                                money = ::money,
+                                onToggle = { open[account.key] = open[account.key] != true },
+                                onRename = { renaming = account },
                             )
                         }
-                        for (account in data.accounts) AccountBlock(account, hidden, ::money)
                         if (data.excluded.isNotEmpty()) {
                             Text(
                                 "Не входят в сумму: ${data.excluded.joinToString(", ")}",
@@ -185,28 +257,61 @@ internal fun AccountsDialog(hidden: Boolean, onDismiss: () -> Unit) {
                                 color = Palette.textDim,
                             )
                         }
+                        Text(
+                            "Нажмите на аккаунт, чтобы раскрыть; удерживайте, чтобы назвать.",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Palette.textDim,
+                        )
                     }
                 }
             }
         },
     )
+    renaming?.let { account ->
+        RenameAccountDialog(
+            current = names[account.key].orEmpty(),
+            placeholder = accountTitle(account, ""),
+            onDismiss = { renaming = null },
+            onSave = { name ->
+                renaming = null
+                names[account.key] = name
+                AppPrefs.setText(context, nameKey(account), name)
+            },
+        )
+    }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun AccountBlock(account: AccountEntry, hidden: Boolean, money: (Double?) -> String) {
+private fun AccountBlock(
+    account: ExchangeAccount,
+    title: String,
+    expanded: Boolean,
+    hidden: Boolean,
+    money: (Double?) -> String,
+    onToggle: () -> Unit,
+    onRename: () -> Unit,
+) {
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .background(Palette.surfaceHigh, RoundedCornerShape(10.dp))
-            .padding(10.dp),
-        verticalArrangement = Arrangement.spacedBy(3.dp),
+            .background(Palette.surfaceHigh, RoundedCornerShape(10.dp)),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            val title = listOf(account.exchange.ifBlank { exchangeTitle(account.brand) }, kindTitle(account.kind))
-                .filter { it.isNotBlank() }
-                .joinToString(" · ")
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier
+                .fillMaxWidth()
+                .combinedClickable(onClick = onToggle, onLongClick = onRename)
+                .padding(horizontal = 10.dp, vertical = 10.dp),
+        ) {
             Text(
-                title.ifBlank { "Биржа не известна" },
+                if (expanded) "▾" else "▸",
+                style = MaterialTheme.typography.titleSmall,
+                color = Palette.textDim,
+            )
+            Spacer(Modifier.width(6.dp))
+            Text(
+                title,
                 style = MaterialTheme.typography.titleSmall,
                 fontWeight = FontWeight.SemiBold,
                 modifier = Modifier.weight(1f),
@@ -219,48 +324,100 @@ private fun AccountBlock(account: AccountEntry, hidden: Boolean, money: (Double?
                 fontWeight = FontWeight.SemiBold,
             )
         }
-        val notes = buildList {
-            if (account.free != null) add("свободно ${money(account.free)}")
-            account.pnl?.takeIf { it != 0.0 }?.let { add("PnL ${if (hidden) HIDDEN else signed(it)}") }
-            when (account.state) {
-                "stale" -> add("данные до потери связи")
-                "awaiting" -> add("ждём баланс")
-                "unpriced" -> add("нет курса к USDT")
+        if (expanded) {
+            Column(
+                modifier = Modifier.padding(start = 10.dp, end = 10.dp, bottom = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                for (wallet in account.wallets) WalletBlock(wallet, hidden, money)
             }
-        }
-        if (notes.isNotEmpty()) {
-            Text(notes.joinToString(" · "), style = MaterialTheme.typography.labelMedium, color = Palette.textDim)
-        }
-        Text(
-            (if (account.cores.size > 1) "Ядра (${account.cores.size}): " else "Ядро: ") + account.cores.joinToString(", "),
-            style = MaterialTheme.typography.labelSmall,
-            color = Palette.textDim,
-        )
-        if (account.assets.isEmpty() && account.smallCount == 0) {
-            Text(
-                when (account.kind) {
-                    "futures", "quarterly" -> "Открытых позиций нет"
-                    "unified" -> "Монет и позиций нет"
-                    else -> "Монет нет"
-                },
-                style = MaterialTheme.typography.labelMedium,
-                color = Palette.textDim,
-            )
-        }
-        for (asset in account.assets) AssetLine(asset, hidden, money)
-        if (account.smallCount > 0) {
-            val worth = if (account.smallUsdt > 0.0) " на ${money(account.smallUsdt)} USDT" else ""
-            Text(
-                "ещё мелких монет: ${account.smallCount}$worth",
-                style = MaterialTheme.typography.labelSmall,
-                color = Palette.textDim,
-            )
         }
     }
 }
 
 @Composable
-private fun AssetLine(asset: AccountAsset, hidden: Boolean, money: (Double?) -> String) {
+private fun WalletBlock(wallet: Wallet, hidden: Boolean, money: (Double?) -> String) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(Palette.surface, RoundedCornerShape(8.dp))
+            .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(3.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                walletTitle(wallet.kind),
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+            )
+            Text("${money(wallet.total)} USDT", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+        }
+        when (wallet.state) {
+            "stale" -> "данные до потери связи"
+            "awaiting" -> "ждём баланс"
+            "unpriced" -> "нет курса к USDT"
+            else -> null
+        }?.let { Text(it, style = MaterialTheme.typography.labelSmall, color = Palette.amber) }
+        if (wallet.assets.isEmpty() && wallet.smallCount == 0 && wallet.orders.isEmpty()) {
+            Text(
+                if (wallet.kind == "futures" || wallet.kind == "quarterly") "Открытых позиций нет" else "Монет нет",
+                style = MaterialTheme.typography.labelMedium,
+                color = Palette.textDim,
+            )
+        }
+        for (asset in wallet.assets) AssetLine(asset, hidden, money)
+        if (wallet.smallCount > 0) {
+            val worth = if (wallet.smallUsdt > 0.0) " на ${money(wallet.smallUsdt)} USDT" else ""
+            Text(
+                "ещё мелких монет: ${wallet.smallCount}$worth",
+                style = MaterialTheme.typography.labelSmall,
+                color = Palette.textDim,
+            )
+        }
+        if (wallet.orders.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Text(
+                "Ордера в стакане: ${wallet.orders.size}",
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = Palette.textDim,
+            )
+            for (order in wallet.orders) OrderLine(order, hidden)
+        }
+    }
+}
+
+/** An order on the book: coin, Buy or Sell, how much at what price, and what it is worth. */
+@Composable
+private fun OrderLine(order: BookOrder, hidden: Boolean) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Text(order.coin, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.width(6.dp))
+        val buy = order.side == "buy"
+        Text(
+            if (buy) "Buy" else "Sell",
+            style = MaterialTheme.typography.labelMedium,
+            color = if (buy) Palette.green else Palette.red,
+        )
+        Spacer(Modifier.width(6.dp))
+        Text(
+            if (hidden) HIDDEN else "${formatPrice(order.amount)} × ${formatPrice(order.price)}",
+            style = MaterialTheme.typography.labelMedium,
+            color = Palette.textDim,
+            modifier = Modifier.weight(1f),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            (if (hidden) HIDDEN else formatAmount(order.value)) + " " + order.quote.ifBlank { "$" },
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    }
+}
+
+@Composable
+private fun AssetLine(asset: WalletAsset, hidden: Boolean, money: (Double?) -> String) {
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
         Text(asset.coin, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Medium)
         if (asset.kind == "position") {
@@ -281,20 +438,34 @@ private fun AssetLine(asset: AccountAsset, hidden: Boolean, money: (Double?) -> 
             maxLines = 1,
             overflow = TextOverflow.Ellipsis,
         )
-        Column(horizontalAlignment = Alignment.End) {
-            Text(
-                asset.value?.let { "${money(it)} $" } ?: "без цены",
-                style = MaterialTheme.typography.bodyMedium,
-            )
-            asset.pnl?.let {
-                Text(
-                    if (hidden) HIDDEN else signed(it),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = if (it < 0.0) Palette.red else Palette.green,
-                )
-            }
-        }
+        Text(
+            asset.value?.let { "${money(it)} $" } ?: "без цены",
+            style = MaterialTheme.typography.bodyMedium,
+        )
     }
 }
 
-private fun signed(value: Double): String = (if (value > 0.0) "+" else "") + formatAmount(value)
+@Composable
+private fun RenameAccountDialog(current: String, placeholder: String, onDismiss: () -> Unit, onSave: (String) -> Unit) {
+    var name by remember { mutableStateOf(current) }
+    MoonDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Название аккаунта") },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                singleLine = true,
+                placeholder = { Text(placeholder) },
+                modifier = Modifier.fillMaxWidth(),
+            )
+        },
+        confirmButton = { TextButton(onClick = { onSave(name.trim()) }) { Text("Сохранить") } },
+        dismissButton = {
+            Row {
+                if (current.isNotEmpty()) TextButton(onClick = { onSave("") }) { Text("Как было") }
+                TextButton(onClick = onDismiss) { Text("Отмена") }
+            }
+        },
+    )
+}
