@@ -142,7 +142,10 @@ data class Strategy(
     val short: Boolean,
 )
 
-/** Every connected account in USDT; cores on one exchange account count once. */
+/**
+ * Every connected account in USDT. [total] is the exchange's wallets, as «Балансы бирж» shows them;
+ * [free] and the counts are the cores' own figures, cores on one exchange account counted once.
+ */
 data class Total(
     val total: Double?,
     val free: Double?,

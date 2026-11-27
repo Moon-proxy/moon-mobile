@@ -106,8 +106,17 @@ struct Member {
     mode: TotalMode,
 }
 
-/// The accounts behind the total, each once. With `refresh`, the counted spot cores are asked for
-/// their wallet list again (coins some exchanges list only there), at most every 30 s per core.
+/// The main screen's «Общий баланс»: what all the accounts hold together, the same figure the
+/// balances window shows. A core's own figure is its account currency only — a spot core leaves
+/// out the coins it bought — so the sum goes by the exchange's wallet lists instead. A futures
+/// wallet's list does not come by itself, so each wallet's list is asked for again, at most every
+/// 30 s per core, while the app runs.
+pub fn total(session: &SessionManager, config: &AppConfig) -> Option<f64> {
+    accounts(session, config, true).total
+}
+
+/// The accounts behind the total, each once. With `refresh`, a live core of each wallet is asked
+/// for the wallet list again (coins some exchanges list only there), at most every 30 s per core.
 pub fn accounts(session: &SessionManager, config: &AppConfig, refresh: bool) -> AccountsDto {
     let store = session.store();
     let mut members: Vec<Member> = Vec::new();
@@ -139,7 +148,7 @@ pub fn accounts(session: &SessionManager, config: &AppConfig, refresh: bool) -> 
             mode: core_total_mode(&config.servers, server.id),
         });
     }
-    // The total exactly as the Cores screen sums it.
+    // The cores' own figures summed, for when no wallet has a figure yet.
     let sum = aggregate_account_figures(session, &config.servers, &figures).sum;
 
     // Groups in first-seen order, as the total folds them: `Exclude` stays out, `Separate` and an
@@ -193,7 +202,7 @@ pub fn accounts(session: &SessionManager, config: &AppConfig, refresh: bool) -> 
     }
 
     let accounts = gather(session, wallets);
-    // What the accounts here hold together; the Cores screen's total counts the cores' own figures.
+    // What the accounts here hold together; the main screen's total is this same figure.
     let totals: Vec<f64> = accounts.iter().filter_map(|a| a.total).collect();
     let total = if totals.is_empty() { sum.total } else { Some(totals.iter().sum()) };
     AccountsDto { total, accounts, excluded }
