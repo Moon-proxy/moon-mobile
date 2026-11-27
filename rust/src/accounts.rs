@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use moon_core::config::{AppConfig, TotalMode};
 use moon_core::session::balances::{aggregate_account_figures, core_total_mode, BalanceFigures};
 use moon_core::session::{BalanceState, CoreId, SessionManager};
-use moon_core::venue::{AccountMergeKey, Brand, MarketKind};
+use moon_core::venue::{AccountMergeKey, Brand, MarketKind, WalletScope};
 use serde::Serialize;
 
 /// A holding worth less than this, in USDT, is counted among the small ones, not listed.
@@ -99,6 +99,10 @@ struct Member {
     name: String,
     figures: BalanceFigures,
     merge: Option<AccountMergeKey>,
+    /// Where the total does not fold the exchange (Gate, HTX: their cores state only a deposit
+    /// address): the address and the market, so cores of one address and market show as one
+    /// wallet here.
+    by_address: Option<(Brand, String, MarketKind)>,
     mode: TotalMode,
 }
 
@@ -119,11 +123,19 @@ pub fn accounts(session: &SessionManager, config: &AppConfig, refresh: bool) -> 
             total: data.assets.global.total_usdt,
         };
         figures.push((server.id, server.name.clone(), reading));
+        let merge = session.account_merge_key(server.id);
+        let by_address = merge
+            .is_none()
+            .then(|| session.core_venues().get(&server.id).and_then(|v| v.resolved()))
+            .flatten()
+            .filter(|venue| venue.brand.wallet_scope() == WalletScope::NeverFold)
+            .and_then(|venue| account_of(session, server.id).map(|(brand, id)| (brand, id, venue.kind)));
         members.push(Member {
             id: server.id,
             name: server.name.clone(),
             figures: reading,
-            merge: session.account_merge_key(server.id),
+            merge,
+            by_address,
             mode: core_total_mode(&config.servers, server.id),
         });
     }
@@ -131,12 +143,23 @@ pub fn accounts(session: &SessionManager, config: &AppConfig, refresh: bool) -> 
     let sum = aggregate_account_figures(session, &config.servers, &figures).sum;
 
     // Groups in first-seen order, as the total folds them: `Exclude` stays out, `Separate` and an
-    // unknown account stand alone, `Auto` cores of one account form one group.
+    // unknown account stand alone, `Auto` cores of one account form one group. Cores of Gate and
+    // HTX, which the total never folds, group here by their deposit address and market: one
+    // address is one account, and its cores on one market read the same wallet.
     let mut excluded = Vec::new();
     let mut groups: Vec<Vec<&Member>> = Vec::new();
     for member in &members {
         match (member.mode, &member.merge) {
             (TotalMode::Exclude, _) => excluded.push(member.name.clone()),
+            (TotalMode::Auto, None) if member.by_address.is_some() => {
+                let existing = groups.iter_mut().find(|g| {
+                    g[0].mode == TotalMode::Auto && g[0].merge.is_none() && g[0].by_address == member.by_address
+                });
+                match existing {
+                    Some(group) => group.push(member),
+                    None => groups.push(vec![member]),
+                }
+            }
             (TotalMode::Separate, _) | (TotalMode::Auto, None) => groups.push(vec![member]),
             (TotalMode::Auto, Some(key)) => {
                 let existing = groups
@@ -163,8 +186,9 @@ pub fn accounts(session: &SessionManager, config: &AppConfig, refresh: bool) -> 
             .unwrap_or(group[0]);
         let mut ordered: Vec<&Member> = vec![kept];
         ordered.extend(group.iter().copied().filter(|m| m.id != kept.id));
-        // Only a wallet the total folds by account belongs to a known account.
-        let owner = kept.merge.as_ref().and_then(|_| account_of(session, kept.id));
+        // A wallet belongs to a known account when the total folds it by account, or, on Gate and
+        // HTX, by the deposit address its cores state.
+        let owner = if kept.merge.is_some() || kept.by_address.is_some() { account_of(session, kept.id) } else { None };
         wallets.push((owner, kept.id, wallet(session, &ordered, refresh)));
     }
 
