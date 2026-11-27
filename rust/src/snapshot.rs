@@ -77,11 +77,13 @@ pub struct HealthDto {
     pub api_quota: Option<u64>,
 }
 
-/// Every connected account in USDT, summed the way the terminal's Assets footer sums it:
-/// cores that report one exchange account count once.
+/// Every connected account in USDT. The total is what the balances window shows — the exchange's
+/// wallets, each once ([`crate::accounts::total`]); the free amount and the counts below are the
+/// cores' own figures, summed the way the terminal's Assets footer sums them: cores that report
+/// one exchange account count once.
 #[derive(Serialize)]
 pub struct TotalDto {
-    /// `null` until at least one core has reported a balance that can be priced.
+    /// `null` until at least one wallet or core has a balance that can be priced.
     pub total: Option<f64>,
     pub free: Option<f64>,
     /// Cores whose figures are in the sum.
@@ -432,7 +434,7 @@ pub fn build(
     Snapshot {
         market_data,
         total: TotalDto {
-            total: sum.total,
+            total: crate::accounts::total(session, config),
             free: sum.free,
             counted: sum.counted,
             stale: sum.stale,
